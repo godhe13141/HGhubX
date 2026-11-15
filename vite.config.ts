@@ -2,6 +2,7 @@ import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
 import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 
 const host = process.env.TAURI_DEV_HOST;
 const { version } = JSON.parse(
@@ -27,5 +28,11 @@ export default defineConfig({
     target: "es2021",
     minify: "esbuild",
     sourcemap: false,
+    rollupOptions: {
+      input: {
+        main: resolve(import.meta.dirname, "index.html"),
+        web: resolve(import.meta.dirname, "web.html"),
+      },
+    },
   },
 });

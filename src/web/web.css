@@ -1,0 +1,82 @@
+:root {
+  color: #f4f1ea;
+  background: #141414;
+  font-family: "Segoe UI", "PingFang SC", "Noto Sans SC", sans-serif;
+  line-height: 1.45;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  background: #141414;
+}
+
+button, video { font: inherit; }
+
+.page {
+  width: min(1120px, calc(100% - 24px));
+  margin: 0 auto;
+  padding: 16px 0 32px;
+}
+
+.top h1 { margin: 0 0 4px; font-size: 22px; }
+.top p, .status, .stage { color: #c8c2b6; }
+
+.banner {
+  margin: 12px 0;
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: #3a2d12;
+  color: #f3d48a;
+}
+
+.app {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 16px;
+}
+
+section {
+  padding: 12px;
+  border-radius: 14px;
+  background: #222;
+}
+
+h2 { margin: 0 0 10px; font-size: 16px; }
+
+ul { list-style: none; margin: 0; padding: 0; display: grid; gap: 8px; }
+
+button {
+  width: 100%;
+  text-align: left;
+  color: inherit;
+  background: #303030;
+  border: 1px solid #444;
+  border-radius: 10px;
+  padding: 10px 12px;
+}
+
+button[aria-current="true"] { border-color: #e0b15a; background: #3a3224; }
+
+small { display: block; color: #aaa; }
+
+.episodes { display: flex; flex-wrap: wrap; gap: 8px; }
+.episodes button { width: auto; }
+
+.player video, .stage {
+  width: 100%;
+  margin-top: 12px;
+  border-radius: 12px;
+  background: #000;
+}
+
+.player video { display: block; max-height: 60vh; }
+
+p[role="alert"] { color: #ffb4a8; }
+
+@media (min-width: 960px) {
+  .app { grid-template-columns: 280px minmax(0, 1fr); align-items: start; }
+  .player video { max-height: 72vh; }
+}

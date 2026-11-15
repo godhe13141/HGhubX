@@ -28,7 +28,10 @@
     "android:icons": "node scripts/sync-android-icons.mjs",
     "ios:icons": "node scripts/generate-ios-icons.mjs",
     "android:dev": "tauri android dev",
-    "android:build": "tauri android build"
+    "android:build": "tauri android build",
+    "web:serve": "cargo run --manifest-path webhost/Cargo.toml --release -- --dist dist",
+    "web:fixture": "node scripts/web-fixture.mjs",
+    "test:web": "node scripts/test-web-player.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.12.4",
