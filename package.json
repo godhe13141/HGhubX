@@ -1,7 +1,7 @@
 {
   "name": "hghubx",
   "private": true,
-  "version": "2.1.0",
+  "version": "2.1.2",
   "license": "PolyForm-Noncommercial-1.0.0",
   "type": "module",
   "scripts": {
@@ -50,11 +50,14 @@
     "playwright-core": "1.63.0",
     "tailwindcss": "4.1.17",
     "typescript": "5.9.3",
-    "vite": "7.3.2"
+    "vite": "7.3.8"
   },
   "pnpm": {
     "onlyBuiltDependencies": [
       "esbuild"
-    ]
+    ],
+    "overrides": {
+      "esbuild": "0.28.2"
+    }
   }
 }

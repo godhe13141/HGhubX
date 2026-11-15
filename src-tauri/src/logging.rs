@@ -17,9 +17,103 @@ pub(crate) fn utc_timestamp() -> Result<String, String> {
     format_utc(OffsetDateTime::now_utc())
 }
 
+/// 诊断文本只留主机和失败类别。完整路径、查询串、用户信息和 Bearer 令牌都不落盘。
+pub(crate) fn redact_diagnostics(message: &str) -> String {
+    let mut redacted = String::with_capacity(message.len());
+    let mut rest = message;
+    while let Some(marker) = rest.find("://") {
+        let scheme_start = rest[..marker]
+            .rfind(|c: char| !c.is_ascii_alphanumeric() && c != '+' && c != '.' && c != '-')
+            .map(|index| index + rest[..marker][index..].chars().next().unwrap().len_utf8())
+            .unwrap_or(0);
+        let scheme = &rest[scheme_start..marker];
+        if scheme.is_empty() || !scheme.starts_with(|c: char| c.is_ascii_alphabetic()) {
+            redacted.push_str(&rest[..marker + 3]);
+            rest = &rest[marker + 3..];
+            continue;
+        }
+        let after = &rest[marker + 3..];
+        let end = after
+            .find(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '<' | '>' | ')' | ','))
+            .unwrap_or(after.len());
+        let raw_url = &after[..end];
+        let (had_userinfo, host_and_tail) = match raw_url.rfind('@') {
+            Some(at) => (true, &raw_url[at + 1..]),
+            None => (false, raw_url),
+        };
+        let host_end = host_and_tail
+            .find(|c: char| matches!(c, '/' | '?' | '#'))
+            .unwrap_or(host_and_tail.len());
+        let host = &host_and_tail[..host_end];
+        let tail = &host_and_tail[host_end..];
+        let sensitive = had_userinfo
+            || tail.contains('?')
+            || tail.contains('#')
+            || tail.trim_start_matches('/').contains('/');
+        // A single slash is the origin itself. Anything longer can be a direct media path.
+        let sensitive = sensitive || (tail.len() > 1 && tail != "/");
+        redacted.push_str(&rest[..scheme_start]);
+        redacted.push_str(scheme);
+        redacted.push_str("://");
+        redacted.push_str(host);
+        if sensitive {
+            redacted.push_str("/[redacted]");
+        } else {
+            redacted.push_str(tail);
+        }
+        rest = &after[end..];
+    }
+    redacted.push_str(rest);
+    redact_assignments(&redacted)
+}
+
+fn redact_assignments(message: &str) -> String {
+    let mut out = String::with_capacity(message.len());
+    let lower = message.to_ascii_lowercase();
+    let bytes = lower.as_bytes();
+    let mut i = 0;
+    let mut last = 0;
+    while i < bytes.len() {
+        if bytes[i..].starts_with(b"bearer ") {
+            let value = i + "bearer ".len();
+            let mut end = value;
+            while end < bytes.len() && !bytes[end].is_ascii_whitespace() && !matches!(bytes[end], b'"' | b'\'' | b'<' | b'>') {
+                end += 1;
+            }
+            if end - value >= 8 {
+                out.push_str(&message[last..i]);
+                out.push_str("Bearer [redacted]");
+                last = end;
+                i = end;
+                continue;
+            }
+        }
+        const KEYS: [&str; 6] = ["auth_key=", "access_token=", "refresh_token=", "token=", "password=", "secret="];
+        if let Some(key) = KEYS.iter().find(|key| bytes[i..].starts_with(key.as_bytes())) {
+            let boundary = i == 0 || !bytes[i - 1].is_ascii_alphanumeric();
+            if boundary {
+                let value = i + key.len();
+                let mut end = value;
+                while end < bytes.len() && !matches!(bytes[end], b'&' | b'#' | b'"' | b'\'' | b' ' | b'\n' | b'\r' | b'<') {
+                    end += 1;
+                }
+                out.push_str(&message[last..value]);
+                out.push_str("[redacted]");
+                last = end;
+                i = end;
+                continue;
+            }
+        }
+        i += message[i..].chars().next().unwrap().len_utf8();
+    }
+    out.push_str(&message[last..]);
+    out
+}
+
 pub(crate) fn append_debug(dir: &Path, message: &str) -> Result<(), String> {
     let _writer = DEBUG_WRITER.lock().map_err(|_| "日志锁失败")?;
     fs::create_dir_all(dir).map_err(|_| "无法创建日志目录")?;
+    let message = redact_diagnostics(message);
     let at = utc_timestamp()?;
     let prefix = format!("[{at}] [pid={}] ", std::process::id());
     let mut record = String::new();
@@ -126,6 +220,24 @@ mod tests {
             assert_eq!(pair[1], pair[0].replace("start ", "end "));
             assert!(pair[0].contains("Z] [pid="));
         }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn debug_log_drops_media_urls_userinfo_and_bearer_tokens() {
+        let raw = "error sending request for url (https://user:secret@cdn.example/videos/a.m3u8?auth_key=supersecret&v=1) ← Bearer abcdefghijklmnop password=hunter2";
+        let safe = redact_diagnostics(raw);
+        assert!(safe.contains("cdn.example"));
+        assert!(safe.contains("/[redacted]"));
+        assert!(!safe.contains("supersecret") && !safe.contains("auth_key=") && !safe.contains("user:secret"));
+        assert!(!safe.contains("abcdefghijklmnop") && !safe.contains("hunter2"));
+        assert!(safe.contains("Bearer [redacted]") && safe.contains("password=[redacted]"));
+        assert_eq!(redact_diagnostics("https://example.com/"), "https://example.com/");
+        let dir = test_dir();
+        append_debug(&dir, raw).unwrap();
+        let stored = fs::read_to_string(dir.join("debug.log")).unwrap();
+        assert!(!stored.contains("supersecret") && !stored.contains("hunter2"));
+        assert!(stored.contains("cdn.example"));
         fs::remove_dir_all(dir).unwrap();
     }
 }

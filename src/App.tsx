@@ -322,7 +322,8 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    if (!import.meta.env.DEV) return;
+    // 固定剧集自检会访问上游。默认不跑，只有显式打开 VITE_HGHUBX_SELF_TEST=1 才启用。
+    if (import.meta.env.VITE_HGHUBX_SELF_TEST !== "1") return;
     const t = window.setTimeout(() => {
       selfTest().then((r) => { invoke("debug_log", { msg: r }).catch(() => {}); }).catch(() => {});
     }, 2500);

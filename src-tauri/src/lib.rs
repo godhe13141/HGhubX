@@ -38,21 +38,49 @@ fn allowed_dev_host(host: &str) -> bool {
         .is_some_and(|v| host.eq_ignore_ascii_case(v.trim()))
 }
 
-fn allowed_frontend_origin(origin: &str) -> bool {
+pub(crate) fn allowed_frontend_origin(origin: &str) -> bool {
     if matches!(
         origin,
         "tauri://localhost" | "http://tauri.localhost" | "https://tauri.localhost"
     ) {
         return true;
     }
-    // 移动端开发可能使用 TAURI_DEV_HOST；严格模式下仅放行本机或显式配置的 TAURI_DEV_HOST。
+    // 开发服务器只在 debug 构建放行，并且无论严格模式是否关闭，都只接受本机或显式 TAURI_DEV_HOST。
     cfg!(debug_assertions)
         && url::Url::parse(origin).is_ok_and(|u| {
             u.scheme() == "http"
                 && u.port() == Some(1420)
-                && (!network_policy::strict_security()
-                    || u.host_str().is_some_and(allowed_dev_host))
+                && u.host_str().is_some_and(allowed_dev_host)
         })
+}
+
+/// 带 IPC 的 WebView 只能停留在应用自己的页面和播放器必需的内部媒体源。
+/// 严格模式、`--no-strict` 都不能把外部 http(s) 页面放进来；外链走 `open_url`。
+pub(crate) fn allowed_navigation(url: &url::Url, _strict: bool) -> bool {
+    if !url.username().is_empty() || url.password().is_some() {
+        return false;
+    }
+    let host = url
+        .host_str()
+        .unwrap_or("")
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    match url.scheme() {
+        "tauri" | "hg" => host == "localhost",
+        "http" | "https" => {
+            matches!(
+                host.as_str(),
+                "tauri.localhost" | "hg.localhost" | "ipc.localhost"
+            ) || (url.scheme() == "http"
+                && matches!(host.as_str(), "127.0.0.1" | "localhost")
+                && url.port() == Some(17650))
+                || (cfg!(debug_assertions)
+                    && url.scheme() == "http"
+                    && url.port() == Some(1420)
+                    && url.host_str().is_some_and(allowed_dev_host))
+        }
+        _ => false,
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -113,14 +141,7 @@ pub fn run() {
                     let _ = webview;
                 })
                 .on_navigation(|_webview, url| {
-                    let host = url.host_str().unwrap_or("");
-                    (url.scheme() == "tauri" && host == "localhost")
-                        // Android 上自定义协议表现为 http://<scheme>.localhost，WebView 有时把它
-                        // 当成一次导航进来。这是进程内的媒体代理地址，不出网，严格模式也不该拦。
-                        || (matches!(url.scheme(), "http" | "https") && host.ends_with(".localhost"))
-                        || allowed_frontend_origin(&url.origin().ascii_serialization())
-                        || (!network_policy::strict_security()
-                            && matches!(url.scheme(), "http" | "https"))
+                    allowed_navigation(url, network_policy::strict_security())
                 })
                 .build(),
         )
@@ -259,4 +280,50 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod navigation_tests {
+    use super::allowed_navigation;
+
+    fn parse(raw: &str) -> url::Url {
+        url::Url::parse(raw).unwrap()
+    }
+
+    #[test]
+    fn external_pages_stay_out_of_the_ipc_webview_in_both_security_modes() {
+        let external = [
+            "https://example.com/",
+            "http://example.com/watch",
+            "https://evil.localhost/",
+            "http://127.0.0.1/",
+            "http://127.0.0.1:9/",
+            "https://127.0.0.1:17650/seg",
+            "file:///etc/passwd",
+            "javascript:alert(1)",
+            "data:text/html,hi",
+            "https://user:password@tauri.localhost/",
+            "tauri://evil.example/",
+        ];
+        let internal = [
+            "tauri://localhost/",
+            "tauri://localhost/index.html",
+            "http://tauri.localhost/",
+            "https://tauri.localhost/",
+            "http://hg.localhost/hls",
+            "https://hg.localhost/img",
+            "http://ipc.localhost/",
+            "hg://localhost/seg",
+            "http://127.0.0.1:17650/seg",
+            "http://localhost:17650/hls",
+        ];
+        for strict in [true, false] {
+            for raw in external {
+                assert!(!allowed_navigation(&parse(raw), strict), "{strict} allowed {raw}");
+            }
+            for raw in internal {
+                assert!(allowed_navigation(&parse(raw), strict), "{strict} blocked {raw}");
+            }
+        }
+    }
 }

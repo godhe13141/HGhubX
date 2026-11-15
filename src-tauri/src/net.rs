@@ -602,28 +602,9 @@ pub fn err_text(e: &reqwest::Error) -> String {
     redact_error_proxy_auth(&out)
 }
 
-/// Transport source chains are not guaranteed to redact proxy userinfo. Remove
-/// userinfo from embedded URLs while keeping hosts and useful failure details.
+/// 错误链里的代理和媒体地址走同一套脱敏：保留主机，去掉用户信息、路径和查询串。
 fn redact_error_proxy_auth(message: &str) -> String {
-    let mut output = String::with_capacity(message.len());
-    let mut rest = message;
-    while let Some(separator) = rest.find("://") {
-        let authority_start = separator + 3;
-        output.push_str(&rest[..authority_start]);
-        rest = &rest[authority_start..];
-        let authority_end = rest.find(|ch: char| ch.is_whitespace() || matches!(ch, '/' | '?' | '#' | '\'' | '"' | '<' | '>'))
-            .unwrap_or(rest.len());
-        let authority = &rest[..authority_end];
-        if let Some(at) = authority.rfind('@') {
-            output.push_str("[redacted]@");
-            output.push_str(&authority[at + 1..]);
-        } else {
-            output.push_str(authority);
-        }
-        rest = &rest[authority_end..];
-    }
-    output.push_str(rest);
-    output
+    crate::logging::redact_diagnostics(message)
 }
 
 #[cfg(test)]
@@ -1447,9 +1428,10 @@ mod tests {
     fn transport_errors_redact_proxy_auth_without_hiding_failure_category() {
         let raw = "error sending request for url (https://example.com/) ← proxy http://demo:secret@[::1]:7897 refused; socks5h://name:token@proxy.example:1080/path";
         let safe = redact_error_proxy_auth(raw);
-        assert!(!safe.contains("demo") && !safe.contains("secret") && !safe.contains("name:token"));
-        assert!(safe.contains("https://example.com/") && safe.contains("[::1]:7897 refused"));
-        assert!(safe.contains("socks5h://[redacted]@proxy.example:1080/path"));
+        assert!(!safe.contains("demo") && !safe.contains("secret") && !safe.contains("name:token") && !safe.contains("/path"));
+        assert!(safe.contains("https://example.com/") && safe.contains("[::1]:7897"));
+        assert!(safe.contains("socks5h://proxy.example:1080/[redacted]"));
+        assert!(safe.contains("refused"));
         assert_eq!(redact_error_proxy_auth("tls handshake eof"), "tls handshake eof");
     }
 

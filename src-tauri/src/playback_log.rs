@@ -297,6 +297,7 @@ fn debug_lines(dir: &Path) -> Result<Vec<String>, String> {
             None => (None, line),
         };
         let rest = rest.strip_prefix(&format!("[pid={pid}] ")).unwrap_or(rest);
+        let rest = crate::logging::redact_diagnostics(rest);
         out.push(
             json!({
                 "ts": stamp,
@@ -431,6 +432,25 @@ mod tests {
         log.dir = Some(dir.join("missing"));
         assert!(log.set(false).is_err());
         assert!(log.enabled);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn diagnostic_export_redacts_urls_already_stored_in_debug_log() {
+        let dir = std::env::temp_dir().join(format!(
+            "hghubx-debug-export-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("debug.log"),
+            "[2026-01-01T00:00:00Z] [pid=1] https://cdn.example/videos/a.m3u8?auth_key=supersecret\n",
+        )
+        .unwrap();
+        let exported = debug_lines(&dir).unwrap().join("\n");
+        assert!(!exported.contains("supersecret") && !exported.contains("auth_key"));
+        assert!(exported.contains("cdn.example") && exported.contains("[redacted]"));
         fs::remove_dir_all(dir).unwrap();
     }
 }

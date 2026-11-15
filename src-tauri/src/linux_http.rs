@@ -8,6 +8,11 @@
 //! 原生完成，而它需要一个真正可取的 HTTP 地址——就是这个服务。
 //!
 //! 端口固定，前端 `src/api.ts` 的 `LOCAL` 必须与 [`ORIGIN`] 一致。
+//!
+//! 来源边界：校验 `Host`，拒绝带外来 `Origin` 的请求，也拒绝没有 Origin 但
+//! `Sec-Fetch-Site: cross-site` 的浏览器嵌入请求。CORS 只回显已经接受的应用 Origin，
+//! 不再使用 `*`。GStreamer 不发送 Origin 和 Fetch Metadata，所以这类本机非浏览器客户端
+//! 仍然可以连接。这不是对抗同一用户其他进程的认证方案。
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
@@ -39,60 +44,133 @@ pub fn start() {
     });
 }
 
-fn serve(mut stream: TcpStream) -> std::io::Result<()> {
-    let timeout = Some(std::time::Duration::from_secs(30));
-    stream.set_read_timeout(timeout)?;
-    stream.set_write_timeout(timeout)?;
+struct Accepted<'a> {
+    method: &'a str,
+    path: &'a str,
+    query: &'a str,
+    range: Option<String>,
+    origin: Option<String>,
+}
 
-    let mut reader = BufReader::new(stream.try_clone()?);
-    let mut request_line = String::new();
-    if reader.read_line(&mut request_line)? == 0 {
-        return Ok(());
+/// 在接触上游之前决定这个回环请求能不能进媒体代理。
+fn accept_request<'a>(head: &'a str, expected_host: &str) -> Result<Accepted<'a>, u16> {
+    let mut lines = head.split("\r\n");
+    let mut request = lines.next().unwrap_or("").split_whitespace();
+    let method = request.next().ok_or(400u16)?;
+    let target = request.next().ok_or(400u16)?;
+    if request.next() != Some("HTTP/1.1") || request.next().is_some() {
+        return Err(400);
     }
+    if method != "GET" && method != "HEAD" {
+        return Err(405);
+    }
+    if !target.starts_with('/') || target.starts_with("//") {
+        return Err(400);
+    }
+    let (path, query) = target.split_once('?').unwrap_or((target, ""));
+    let mut host = None;
+    let mut origin = None;
+    let mut fetch_site = None;
     let mut range = None;
     let mut range_count = 0;
     let mut if_range = false;
-    loop {
-        let mut line = String::new();
-        if reader.read_line(&mut line)? == 0 || line.trim_end().is_empty() {
+    for line in lines {
+        if line.is_empty() {
             break;
         }
-        if let Some((name, value)) = line.split_once(':') {
-            if name.eq_ignore_ascii_case("Range") {
-                range_count += 1;
-                range = Some(value.trim().to_owned());
-            } else if name.eq_ignore_ascii_case("If-Range") {
-                if_range = true;
+        let (name, value) = line.split_once(':').ok_or(400u16)?;
+        let value = value.trim();
+        if value.chars().any(|c| c.is_control()) {
+            return Err(400);
+        }
+        if name.eq_ignore_ascii_case("Host") {
+            if host.is_some() {
+                return Err(400);
             }
+            host = Some(value);
+        } else if name.eq_ignore_ascii_case("Origin") {
+            if origin.is_some() {
+                return Err(400);
+            }
+            origin = Some(value.to_string());
+        } else if name.eq_ignore_ascii_case("Sec-Fetch-Site") {
+            fetch_site = Some(value);
+        } else if name.eq_ignore_ascii_case("Range") {
+            range_count += 1;
+            range = Some(value.to_string());
+        } else if name.eq_ignore_ascii_case("If-Range") {
+            if_range = true;
         }
     }
-
-    let mut request = request_line.split_whitespace();
-    let method = request.next().unwrap_or_default();
-    let target = request.next().unwrap_or("/");
-    if method != "GET" && method != "HEAD" {
-        return write_plain(&mut stream, 405, "method not allowed");
+    if host != Some(expected_host) {
+        return Err(403);
     }
-
-    let (path, query) = match target.split_once('?') {
-        Some((path, query)) => (path, query),
-        None => (target, ""),
-    };
-
+    if let Some(origin) = origin.as_deref() {
+        if !crate::allowed_frontend_origin(origin) {
+            return Err(403);
+        }
+    } else if fetch_site.is_some_and(|site| site.eq_ignore_ascii_case("cross-site")) {
+        return Err(403);
+    }
     let range = if method == "GET" && range_count == 1 && !if_range {
-        range.as_deref()
+        range
     } else {
         None
     };
-    let response = tauri::async_runtime::block_on(crate::media::handle(path, query, ORIGIN, range));
-    let (parts, body) = response.into_parts();
+    Ok(Accepted { method, path, query, range, origin })
+}
 
-    write_response(&mut stream, method, parts, &body)
+fn serve(stream: TcpStream) -> std::io::Result<()> {
+    serve_connection(stream, &format!("127.0.0.1:{PORT}"))
+}
+
+fn serve_connection(mut stream: TcpStream, expected_host: &str) -> std::io::Result<()> {
+    let timeout = Some(std::time::Duration::from_secs(30));
+    stream.set_read_timeout(timeout)?;
+    stream.set_write_timeout(timeout)?;
+    let mut reader = BufReader::new(stream.try_clone()?);
+    let mut head = Vec::new();
+    const MAX_HEADERS: usize = 16 * 1024;
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            return Ok(());
+        }
+        let room = MAX_HEADERS.saturating_add(1).saturating_sub(head.len());
+        let take = available.len().min(room);
+        let end = available[..take].windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4);
+        let count = end.unwrap_or(take);
+        head.extend_from_slice(&available[..count]);
+        reader.consume(count);
+        if head.len() > MAX_HEADERS {
+            return write_plain(&mut stream, 431, "headers too large");
+        }
+        if head.windows(4).any(|w| w == b"\r\n\r\n") {
+            break;
+        }
+    }
+    let text = match std::str::from_utf8(&head) {
+        Ok(text) => text,
+        Err(_) => return write_plain(&mut stream, 400, "bad request"),
+    };
+    let accepted = match accept_request(text, expected_host) {
+        Ok(accepted) => accepted,
+        Err(status) => return write_plain(&mut stream, status, "request rejected"),
+    };
+    let response = tauri::async_runtime::block_on(crate::media::handle(
+        accepted.path,
+        accepted.query,
+        ORIGIN,
+        accepted.range.as_deref(),
+    ));
+    let (parts, body) = response.into_parts();
+    write_response(&mut stream, accepted.method, accepted.origin.as_deref(), parts, &body)
 }
 
 fn write_response(
     stream: &mut impl Write,
     method: &str,
+    origin: Option<&str>,
     parts: tauri::http::response::Parts,
     body: &[u8],
 ) -> std::io::Result<()> {
@@ -117,7 +195,13 @@ fn write_response(
             head.push_str(&format!("{}: {}\r\n", name.as_str(), value));
         }
     }
-    head.push_str("Access-Control-Allow-Origin: *\r\n");
+    if let Some(origin) = origin {
+        if !origin.chars().any(|c| c.is_control() || matches!(c, '\r' | '\n')) {
+            head.push_str("Access-Control-Allow-Origin: ");
+            head.push_str(origin);
+            head.push_str("\r\nVary: Origin\r\n");
+        }
+    }
     head.push_str("Connection: close\r\n\r\n");
     stream.write_all(head.as_bytes())?;
     if method != "HEAD" {
@@ -128,7 +212,7 @@ fn write_response(
 
 #[cfg(test)]
 mod tests {
-    use super::write_response;
+    use super::{serve_connection, write_response, TcpListener, TcpStream};
     use tauri::http::Response;
 
     #[test]
@@ -143,13 +227,15 @@ mod tests {
             .unwrap()
             .into_parts();
         let mut wire = Vec::new();
-        write_response(&mut wire, "GET", parts, &body).unwrap();
+        write_response(&mut wire, "GET", Some("http://tauri.localhost"), parts, &body).unwrap();
         let wire = String::from_utf8(wire).unwrap();
         let (head, data) = wire.split_once("\r\n\r\n").unwrap();
         let headers = head.to_ascii_lowercase();
         assert_eq!(headers.matches("content-length:").count(), 1);
         assert!(headers.contains("content-length: 8\r\n"));
         assert_eq!(headers.matches("access-control-allow-origin:").count(), 1);
+        assert!(headers.contains("access-control-allow-origin: http://tauri.localhost"));
+        assert!(!headers.contains("access-control-allow-origin: *"));
         assert_eq!(headers.matches("connection:").count(), 1);
         assert!(headers.ends_with("connection: close"));
         assert!(!headers.contains("transfer-encoding:"));
@@ -166,12 +252,70 @@ mod tests {
             .unwrap()
             .into_parts();
         let mut wire = Vec::new();
-        write_response(&mut wire, "HEAD", parts, &body).unwrap();
+        write_response(&mut wire, "HEAD", None, parts, &body).unwrap();
         let wire = String::from_utf8(wire).unwrap();
         assert!(wire.starts_with("HTTP/1.1 206 Partial Content\r\n"));
         assert!(wire.contains("Content-Length: 4\r\n"));
         assert!(wire.contains("content-range: bytes 0-3/20\r\n"));
         assert!(wire.ends_with("\r\n\r\n"));
+        assert!(!wire.to_ascii_lowercase().contains("access-control-allow-origin: *"));
+    }
+
+    fn exchange(request: &str) -> String {
+        use std::io::{Read, Write};
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let expected = format!("127.0.0.1:{port}");
+        let server = std::thread::spawn(move || {
+            let (socket, _) = listener.accept().unwrap();
+            serve_connection(socket, &expected).unwrap();
+        });
+        let mut client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        client.set_read_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
+        client.write_all(request.replace("{port}", &port.to_string()).as_bytes()).unwrap();
+        let mut body = String::new();
+        let _ = client.read_to_string(&mut body);
+        server.join().unwrap();
+        body
+    }
+
+    #[test]
+    fn socket_rejects_foreign_and_cross_site_requests_before_the_media_proxy() {
+        let foreign = exchange(
+            "GET /seg?u=http://127.0.0.1:1/secret-media HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nOrigin: https://evil.example\r\nConnection: close\r\n\r\n",
+        );
+        assert!(foreign.starts_with("HTTP/1.1 403"), "{foreign}");
+        assert!(!foreign.contains("secret-media"));
+
+        let cross_site = exchange(
+            "GET /seg?u=http://127.0.0.1:1/secret-media HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nSec-Fetch-Site: cross-site\r\nConnection: close\r\n\r\n",
+        );
+        assert!(cross_site.starts_with("HTTP/1.1 403"), "{cross_site}");
+        assert!(!cross_site.contains("secret-media"));
+
+        let wrong_host = exchange(
+            "GET /no-such HTTP/1.1\r\nHost: evil.example\r\nConnection: close\r\n\r\n",
+        );
+        assert!(wrong_host.starts_with("HTTP/1.1 403"), "{wrong_host}");
+    }
+
+    #[test]
+    fn socket_accepts_player_and_app_origins_without_a_wildcard() {
+        let player = exchange(
+            "GET /seg HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n",
+        );
+        assert!(player.starts_with("HTTP/1.1 400"), "{player}");
+        assert!(player.contains("missing u"));
+        assert!(!player.to_ascii_lowercase().contains("access-control-allow-origin: *"));
+
+        let app = exchange(
+            "GET /not-a-route?u=https://fixture.invalid/clip HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nOrigin: http://tauri.localhost\r\nSec-Fetch-Site: cross-site\r\nConnection: close\r\n\r\n",
+        );
+        assert!(app.starts_with("HTTP/1.1 404"), "{app}");
+        assert!(app.contains("not found"));
+        assert!(!app.contains("fixture.invalid"));
+        assert!(app.to_ascii_lowercase().contains("access-control-allow-origin: http://tauri.localhost"));
+        assert!(!app.to_ascii_lowercase().contains("access-control-allow-origin: *"));
     }
 }
 

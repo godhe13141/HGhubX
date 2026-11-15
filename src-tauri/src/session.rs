@@ -1,8 +1,29 @@
-//! 会话持久化：token + 用户资料存到应用数据目录。
+//! 会话持久化：token 与用户资料仍是应用数据目录里的明文 JSON。
+//! Unix 把该目录收成 `0700`、`session.json` 收成 `0600`（含升级前已存在的文件）。
+//! 其他平台没有接入系统凭据库，这里不表示 token 已加密，也不表示跨平台受到同等保护。
 
 use serde::{Deserialize, Serialize};
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Mutex;
+
+fn write_private(path: &std::path::Path, text: &str) -> std::io::Result<()> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    file.write_all(text.as_bytes())?;
+    file.flush()
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 pub struct Session {
@@ -88,6 +109,32 @@ mod tests {
         assert!(!store.set_if_revision(revision, origin, "late".into(), json!({"id": 1})));
         assert_eq!(store.user(origin)["id"], 2);
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn persisted_credentials_are_user_only_even_for_an_existing_loose_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!(
+            "hghubx-session-mode-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = dir.join("session.json");
+        std::fs::write(&path, "{}").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let store = SessionStore::new();
+        store.bind(dir.clone());
+        assert_eq!(std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777, 0o700);
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        store.set("https://example.test", "private-token".into(), json!({"id": 1}));
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(saved.contains("private-token"));
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777, 0o700);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }
 
 pub struct SessionStore {
@@ -104,8 +151,18 @@ impl SessionStore {
     }
 
     pub fn bind(&self, dir: PathBuf) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+        }
         let mut path = dir;
         path.push("session.json");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        }
         if let Ok(text) = std::fs::read_to_string(&path) {
             if let Ok(sess) = serde_json::from_str::<Session>(&text) {
                 *self.current.lock().unwrap() = sess;
@@ -213,7 +270,7 @@ impl SessionStore {
         let snapshot = self.current.lock().unwrap();
         if let Some(path) = self.file.lock().unwrap().as_ref() {
             if let Ok(text) = serde_json::to_string_pretty(&*snapshot) {
-                let _ = std::fs::write(path, text);
+                let _ = write_private(path, &text);
             }
         }
     }
